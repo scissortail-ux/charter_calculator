@@ -120,32 +120,34 @@
     renderClassOptions(Number(paxEl.value || 1), clsSel.value);
   });
 
+  function fill(sel, cities) {
+    sel.innerHTML = "";
+    const sorted = [...cities].sort((a, b) => (a.label || "").localeCompare(b.label || ""));
+    for (const c of sorted) {
+      const opt = document.createElement("option");
+      opt.value = c.cityKey;            // cityKey is still the primary value
+      opt.textContent = c.label;
+      opt.dataset.icao = c.icao || "";  // ✅ ICAO fallback for server matching
+      sel.appendChild(opt);
+    }
+  }
+
   async function loadCities() {
     const r = await fetch(api + "/cities");
     if (!r.ok) throw new Error("Could not load cities");
     const data = await r.json();
+
     const cities = data.cities || [];
-    const homeBaseCityKey = data.homeBaseCityKey;
+    fill(fromSel, cities);
+    fill(toSel, cities);
 
-    function fill(sel) {
-      sel.innerHTML = "";
-      for (const c of cities) {
-        const opt = document.createElement("option");
-        opt.value = c.cityKey;
-        opt.textContent = c.label;
-        sel.appendChild(opt);
-      }
-    }
+    // Default FROM = Austin (home base)
+    const homeKey = data.homeBaseCityKey || "Austin, TX, US";
+    fromSel.value = homeKey;
 
-    fill(fromSel);
-    fill(toSel);
-
-    // Default FROM = Austin
-    fromSel.value = homeBaseCityKey || "Austin, TX, US";
-
-    // Default TO: first non-Austin
-    const firstNon = cities.find((x) => x.cityKey !== fromSel.value);
-    if (firstNon) toSel.value = firstNon.cityKey;
+    // Default TO = first non-Austin
+    const firstNon = Array.from(toSel.options).find((o) => o.value !== homeKey);
+    if (firstNon) toSel.value = firstNon.value;
   }
 
   btn.addEventListener("click", async () => {
@@ -165,9 +167,14 @@
       return;
     }
 
+    const fromOpt = fromSel.options[fromSel.selectedIndex];
+    const toOpt = toSel.options[toSel.selectedIndex];
+
     const body = {
       fromCityKey: fromSel.value,
       toCityKey: toSel.value,
+      fromIcao: fromOpt?.dataset?.icao || undefined,
+      toIcao: toOpt?.dataset?.icao || undefined,
       departDateISO,
       isRoundTrip,
       returnDateISO,
@@ -213,7 +220,7 @@
               <div>Parking/handling: <b>${money((b.parking?.low ?? 0))}–${money((b.parking?.high ?? 0))}</b></div>
               <div style="margin-top:8px;color:#666;">
                 Volatility buffer: ±${Math.round((b.volatility_multiplier ?? 0) * 100)}%
-                ${b.mode ? ` • Mode: ${b.mode}` : ""}
+                ${b.markup_pct != null ? ` • Markup: ${Math.round(b.markup_pct * 100)}%` : ""}
               </div>
 
               ${legs.length ? `

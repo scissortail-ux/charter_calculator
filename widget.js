@@ -2,7 +2,6 @@
   const script = document.currentScript;
   const apiBase = script?.getAttribute("data-api");
   if (!apiBase) return;
-
   const api = apiBase.replace(/\/$/, "");
 
   const root = document.createElement("div");
@@ -10,7 +9,7 @@
   root.style.border = "1px solid #ddd";
   root.style.borderRadius = "12px";
   root.style.padding = "16px";
-  root.style.maxWidth = "640px";
+  root.style.maxWidth = "720px";
   root.style.boxShadow = "0 1px 2px rgba(0,0,0,0.05)";
 
   root.innerHTML = `
@@ -93,11 +92,11 @@
   }
 
   function allowedClassesForPax(pax) {
-    if (pax <= 4) return ["AUTO","TURBOPROP","LIGHT_JET","MIDSIZE","SUPER_MID","HEAVY_JET"];
-    if (pax <= 6) return ["AUTO","LIGHT_JET","MIDSIZE","SUPER_MID","HEAVY_JET"];
-    if (pax <= 8) return ["AUTO","MIDSIZE","SUPER_MID","HEAVY_JET"];
-    if (pax <= 10) return ["AUTO","SUPER_MID","HEAVY_JET"];
-    return ["AUTO","HEAVY_JET"];
+    if (pax <= 4) return ["AUTO", "TURBOPROP", "LIGHT_JET", "MIDSIZE", "SUPER_MID", "HEAVY_JET"];
+    if (pax <= 6) return ["AUTO", "LIGHT_JET", "MIDSIZE", "SUPER_MID", "HEAVY_JET"];
+    if (pax <= 8) return ["AUTO", "MIDSIZE", "SUPER_MID", "HEAVY_JET"];
+    if (pax <= 10) return ["AUTO", "SUPER_MID", "HEAVY_JET"];
+    return ["AUTO", "HEAVY_JET"];
   }
 
   function renderClassOptions(pax, currentValue) {
@@ -109,18 +108,26 @@
       opt.textContent = CLASS_LABELS[v] || v;
       clsSel.appendChild(opt);
     }
-    // preserve selection if still allowed
-    if (allowed.includes(currentValue)) clsSel.value = currentValue;
+    clsSel.value = allowed.includes(currentValue) ? currentValue : "AUTO";
   }
+
+  tripTypeEl.addEventListener("change", () => {
+    const isRT = tripTypeEl.value === "roundtrip";
+    returnWrap.style.display = isRT ? "flex" : "none";
+  });
+
+  paxEl.addEventListener("input", () => {
+    renderClassOptions(Number(paxEl.value || 1), clsSel.value);
+  });
 
   async function loadCities() {
     const r = await fetch(api + "/cities");
     if (!r.ok) throw new Error("Could not load cities");
     const data = await r.json();
+    const cities = data.cities || [];
+    const homeBaseCityKey = data.homeBaseCityKey;
 
-    const { cities, homeBaseCityKey } = data;
-
-    function fillSelect(sel) {
+    function fill(sel) {
       sel.innerHTML = "";
       for (const c of cities) {
         const opt = document.createElement("option");
@@ -130,26 +137,16 @@
       }
     }
 
-    fillSelect(fromSel);
-    fillSelect(toSel);
+    fill(fromSel);
+    fill(toSel);
 
-    // Default FROM = Austin (home base)
+    // Default FROM = Austin
     fromSel.value = homeBaseCityKey || "Austin, TX, US";
 
-    // Default TO = Dallas (nice quick test), fallback to first non-Austin
-    const firstNonFrom = cities.find(x => x.cityKey !== fromSel.value);
-    if (firstNonFrom) toSel.value = firstNonFrom.cityKey;
+    // Default TO: first non-Austin
+    const firstNon = cities.find((x) => x.cityKey !== fromSel.value);
+    if (firstNon) toSel.value = firstNon.cityKey;
   }
-
-  tripTypeEl.addEventListener("change", () => {
-    const isRT = tripTypeEl.value === "roundtrip";
-    returnWrap.style.display = isRT ? "flex" : "none";
-  });
-
-  paxEl.addEventListener("input", () => {
-    const pax = Number(paxEl.value || 1);
-    renderClassOptions(pax, clsSel.value);
-  });
 
   btn.addEventListener("click", async () => {
     out.innerHTML = `<div style="color:#666;font-size:14px;">Estimating…</div>`;
@@ -157,7 +154,7 @@
     const pax = Number(paxEl.value || 1);
     const departDateISO = String(departEl.value || "").trim();
     const isRoundTrip = tripTypeEl.value === "roundtrip";
-    const returnDateISO = isRoundTrip ? String(returnEl.value || "").trim() || null : null;
+    const returnDateISO = isRoundTrip ? (String(returnEl.value || "").trim() || null) : null;
 
     if (!departDateISO) {
       out.innerHTML = `<div style="color:#b00;">Please select a departure date.</div>`;
@@ -192,6 +189,8 @@
       }
 
       const data = await resp.json();
+      const b = data.breakdown || {};
+      const legs = Array.isArray(b.reposition_legs) ? b.reposition_legs : [];
 
       out.innerHTML = `
         <div style="padding:12px;border:1px solid #eee;border-radius:12px;background:#fafafa;">
@@ -200,25 +199,34 @@
           </div>
 
           <div style="margin-top:6px;color:#333;font-size:13px;">
-            Aircraft: <b>${String(data.input.resolvedClass).replaceAll("_"," ")}</b>
+            Aircraft: <b>${String(b.aircraft_label || b.aircraft_class || "").replaceAll("_"," ")}</b>
             • Home base: <b>Austin (KAUS)</b>
           </div>
 
           <details style="margin-top:10px;">
             <summary style="cursor:pointer;font-weight:800;">See breakdown</summary>
-            <div style="margin-top:8px;font-size:13px;line-height:1.4;">
-              <div>Trip hours (est): <b>${data.breakdown.trip_hours_est}</b></div>
-              <div>Reposition hours (est): <b>${data.breakdown.reposition_hours_est}</b></div>
-              ${data.breakdown.standby_days ? `<div>Standby days: <b>${data.breakdown.standby_days}</b> (modeled modestly)</div>` : ""}
+            <div style="margin-top:8px;font-size:13px;line-height:1.45;color:#333;">
+              <div>Trip hours (est): <b>${b.trip_hours_est ?? "-"}</b></div>
+              <div>Reposition hours (est): <b>${b.reposition_hours_est ?? "-"}</b></div>
+              <div>Wait days: <b>${b.wait_days ?? 0}</b></div>
+              <div style="margin-top:6px;">Fees: <b>${money((b.fees?.low ?? 0))}–${money((b.fees?.high ?? 0))}</b></div>
+              <div>Parking/handling: <b>${money((b.parking?.low ?? 0))}–${money((b.parking?.high ?? 0))}</b></div>
               <div style="margin-top:8px;color:#666;">
-                Range includes volatility buffer (±${Math.round(data.breakdown.volatility_multiplier * 100)}%).
+                Volatility buffer: ±${Math.round((b.volatility_multiplier ?? 0) * 100)}%
+                ${b.mode ? ` • Mode: ${b.mode}` : ""}
               </div>
-              <div style="margin-top:10px;">
-                <div style="font-weight:800;">Assumptions</div>
+
+              ${legs.length ? `
+                <div style="margin-top:10px;font-weight:800;">Reposition legs</div>
                 <ul style="margin:6px 0 0 18px;padding:0;">
-                  ${(data.breakdown.assumptions || []).map(x => `<li>${x}</li>`).join("")}
+                  ${legs.map(l => `<li>${l.from} → ${l.to} (${l.distance_nm} nm, ~${l.hours}h)</li>`).join("")}
                 </ul>
-              </div>
+              ` : ""}
+
+              <div style="margin-top:10px;font-weight:800;">Assumptions</div>
+              <ul style="margin:6px 0 0 18px;padding:0;">
+                ${(b.assumptions || []).map(x => `<li>${x}</li>`).join("")}
+              </ul>
             </div>
           </details>
 
@@ -232,13 +240,12 @@
     }
   });
 
-  // Init
   (async function init() {
     try {
       await loadCities();
       renderClassOptions(Number(paxEl.value || 1), "AUTO");
     } catch (e) {
-      out.innerHTML = `<div style="color:#b00;">Could not load city list. Please try again later.</div>`;
+      out.innerHTML = `<div style="color:#b00;">Could not load city list.</div>`;
     }
   })();
 })();

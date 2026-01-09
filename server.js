@@ -3,23 +3,24 @@ import cors from "cors";
 import { z } from "zod";
 
 /**
- * Charter Cost Estimator API (v1)
+ * Charter Calculator API (v1)
+ * Repo: https://github.com/scissortail-ux/charter_calculator
  * Scope: US + Canada + Mexico + Caribbean + Europe
  * Purpose: broad budget estimates (NOT quotes)
  */
 
 const app = express();
-app.use(cors()); // v1: open CORS. Later you can restrict to your Squarespace domain.
+app.use(cors()); // v1: allow all origins (easy for Squarespace). Later you can restrict.
 app.use(express.json());
 
 /* ----------------------------- Country Lists ---------------------------- */
 
 const CARIBBEAN_COUNTRIES = new Set([
-  "Bahamas","Jamaica","Dominican Republic","Barbados","Saint Martin","Sint Maarten",
-  "Antigua and Barbuda","Saint Lucia","Grenada","Trinidad and Tobago","Aruba",
-  "Curaçao","Turks and Caicos Islands","Puerto Rico","U.S. Virgin Islands",
-  "British Virgin Islands","Cayman Islands","Haiti","Guadeloupe","Martinique",
-  "St. Kitts and Nevis","Saint Vincent and the Grenadines"
+  "Bahamas", "Jamaica", "Dominican Republic", "Barbados", "Saint Martin", "Sint Maarten",
+  "Antigua and Barbuda", "Saint Lucia", "Grenada", "Trinidad and Tobago", "Aruba",
+  "Curaçao", "Turks and Caicos Islands", "Puerto Rico", "U.S. Virgin Islands",
+  "British Virgin Islands", "Cayman Islands", "Haiti", "Guadeloupe", "Martinique",
+  "St. Kitts and Nevis", "Saint Vincent and the Grenadines"
 ]);
 
 const EUROPE_COUNTRIES = new Set([
@@ -75,6 +76,7 @@ const VOLATILITY = {
   "4+": 0.35,
 };
 
+// Basic “remote airport” heuristic (v1). Replace later with real airport tiers/density.
 const MAJOR_AIRPORTS = new Set([
   "KTEB","KHPN","KLGA","KJFK","KEWR","KBOS","KIAD","KDCA","KATL","KMIA","KFLL",
   "KORD","KMDW","KDFW","KDAL","KDEN","KLAX","KSNA","KSFO","KOAK","KSEA","KPHX",
@@ -83,9 +85,11 @@ const MAJOR_AIRPORTS = new Set([
 
 /* ---------------------------- Airport Dataset --------------------------- */
 /**
- * Beginner version: small list. Expand later.
+ * Starter list only. Add more airports over time.
+ * Note: This estimator requires ICAO codes to exist in this list.
  */
 const AIRPORTS = [
+  // US
   { icao: "KTEB", name: "Teterboro", lat: 40.8501, lon: -74.0608, country: "United States" },
   { icao: "KJFK", name: "New York JFK", lat: 40.6413, lon: -73.7781, country: "United States" },
   { icao: "KLAX", name: "Los Angeles", lat: 33.9416, lon: -118.4085, country: "United States" },
@@ -94,18 +98,22 @@ const AIRPORTS = [
   { icao: "KORD", name: "Chicago O'Hare", lat: 41.9742, lon: -87.9073, country: "United States" },
   { icao: "KDAL", name: "Dallas Love Field", lat: 32.8471, lon: -96.8517, country: "United States" },
 
+  // Canada
   { icao: "CYYZ", name: "Toronto Pearson", lat: 43.6777, lon: -79.6248, country: "Canada" },
   { icao: "CYVR", name: "Vancouver", lat: 49.1967, lon: -123.1815, country: "Canada" },
 
+  // Mexico
   { icao: "MMUN", name: "Cancún", lat: 21.0365, lon: -86.8771, country: "Mexico" },
   { icao: "MMSD", name: "Los Cabos (SJD)", lat: 23.1518, lon: -109.7210, country: "Mexico" },
 
+  // Caribbean
   { icao: "MYNN", name: "Nassau", lat: 25.0389, lon: -77.4662, country: "Bahamas" },
   { icao: "MKJP", name: "Montego Bay", lat: 18.5037, lon: -77.9134, country: "Jamaica" },
   { icao: "TJSJ", name: "San Juan", lat: 18.4394, lon: -66.0018, country: "Puerto Rico" },
   { icao: "MDPC", name: "Punta Cana", lat: 18.5674, lon: -68.3634, country: "Dominican Republic" },
 
-  { icao: "EGLL", name: "London Heathrow", lat: 51.4700, lon: -0.4543, country: "United Kingdom" },
+  // Europe
+  { icao: "EGLL", name: "London Heathrow", lat: 51.47, lon: -0.4543, country: "United Kingdom" },
   { icao: "LFPB", name: "Paris Le Bourget", lat: 48.9694, lon: 2.4414, country: "France" },
   { icao: "EDDM", name: "Munich", lat: 48.3538, lon: 11.7861, country: "Germany" },
   { icao: "LEMD", name: "Madrid", lat: 40.4983, lon: -3.5676, country: "Spain" },
@@ -178,9 +186,9 @@ function estimateBlockHours(distanceNm, aircraft, region) {
   const speed = CRUISE_SPEED_KTS[aircraft];
   const flightHours = distanceNm / speed;
 
-  let buffer = 0.4;
-  if (region !== "US_DOMESTIC") buffer += 0.2;
-  if (region === "EUROPE") buffer += 1.0;
+  let buffer = 0.4;            // taxi/climb/descent
+  if (region !== "US_DOMESTIC") buffer += 0.2; // intl planning/ATC
+  if (region === "EUROPE") buffer += 1.0;      // oceanic/winds/congestion
 
   return flightHours + buffer;
 }
@@ -206,26 +214,19 @@ function estimateOvernightNights(isRoundTrip, departDateISO, returnDateISO, regi
   const retDay = Date.UTC(ret.getUTCFullYear(), ret.getUTCMonth(), ret.getUTCDate());
   const diffDays = Math.round((retDay - depDay) / (24 * 3600 * 1000));
 
-  if (diffDays <= 0) return region === "EUROPE" ? 1 : 0;
+  if (diffDays <= 0) return region === "EUROPE" ? 1 : 0; // conservative for Europe
   return diffDays;
 }
 
 function isWeekend(dateISO) {
   const d = new Date(dateISO);
-  const day = d.getUTCDay();
-  return day === 0 || day === 5 || day === 6; // Sun/Fri/Sat
+  const day = d.getUTCDay(); // 0 Sun ... 6 Sat
+  return day === 0 || day === 5 || day === 6; // Sun/Fri/Sat = common peak
 }
 
-function computeRiskScore({
-  departDateISO,
-  region,
-  overnightNights,
-  originIcao,
-  destIcao,
-  shortNoticeDays,
-  timeFlex
-}) {
+function computeRiskScore({ departDateISO, region, overnightNights, originIcao, destIcao, shortNoticeDays, timeFlex }) {
   let risk = 0;
+
   if (shortNoticeDays <= 3) risk += 1;
   if (isWeekend(departDateISO)) risk += 1;
   if (overnightNights > 0) risk += 1;
@@ -235,6 +236,7 @@ function computeRiskScore({
   if (!originMajor || !destMajor) risk += 1;
 
   if (timeFlex === "tight") risk += 1;
+
   if (region === "MEXICO" || region === "CARIBBEAN") risk += 1;
   if (region === "EUROPE") risk += 2;
 
@@ -269,7 +271,7 @@ function estimateTrip(input) {
       confidence: "LOW",
       currency: "USD",
       breakdown: {
-        assumptions: ["Unknown airport(s). Add them to the dataset."],
+        assumptions: ["Unknown airport(s). Add them to the airport dataset."],
         may_change: ["Aircraft availability", "Airport fees", "Crew requirements"],
       },
     };
@@ -286,6 +288,7 @@ function estimateTrip(input) {
 
   const blockPerLeg = estimateBlockHours(distanceNmOneWay, aircraft, region);
   const totalBlockHours = blockPerLeg * legs;
+
   const billableHours = Math.max(totalBlockHours, DAILY_MIN_HOURS);
 
   const rate = RATE_TABLE[aircraft];
@@ -294,7 +297,7 @@ function estimateTrip(input) {
     high: billableHours * rate.high,
   };
 
-  const stops = input.isRoundTrip ? 2 : 1;
+  const stops = input.isRoundTrip ? 2 : 1; // landings: dest (+ origin on return)
   const feePerStop = perStopAllowance(region, aircraft);
   const regionalFees = {
     low: stops * feePerStop.low,
@@ -335,18 +338,18 @@ function estimateTrip(input) {
 
   const assumptions = [
     "Estimate only (not a quote).",
-    "Includes broad allowances for handling/airport/government costs by region.",
-    "Hourly rates reflect market bands and vary by aircraft, operator, and date.",
+    "Includes broad regional allowances for handling/airport/government costs.",
+    "Hourly rates are market bands and vary by operator, aircraft, and date."
   ];
   if (region === "EUROPE") {
-    assumptions.push("Europe estimates are intentionally broad due to fees, taxes/VAT, and availability variability.");
+    assumptions.push("Europe pricing varies widely; this estimate is intentionally broad.");
   }
 
   const mayChange = [
     "Aircraft availability & repositioning",
     "Airport handling/parking charges",
     "Crew duty/rest requirements",
-    "Weather impacts (e.g., deicing) and irregular ops",
+    "Weather impacts (e.g., deicing) and irregular ops"
   ];
 
   const confidence = confidenceFromRegionAndRisk(region, risk);
@@ -379,7 +382,7 @@ function estimateTrip(input) {
 const EstimateRequestSchema = z.object({
   originIcao: z.string().min(3),
   destIcao: z.string().min(3),
-  departDateISO: z.string().min(8), // YYYY-MM-DD
+  departDateISO: z.string().min(8), // YYYY-MM-DD works
   isRoundTrip: z.boolean(),
   returnDateISO: z.string().nullable().optional(),
   pax: z.number().int().min(1).max(30),
@@ -398,11 +401,10 @@ app.post("/estimate", (req, res) => {
   if (!parsed.success) {
     return res.status(400).json({ error: "Invalid request", details: parsed.error.flatten() });
   }
-  const result = estimateTrip(parsed.data);
-  return res.json(result);
+  return res.json(estimateTrip(parsed.data));
 });
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 app.listen(PORT, () => {
-  console.log(`Estimator API running on port ${PORT}`);
+  console.log(`Charter Calculator API running on port ${PORT}`);
 });

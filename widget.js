@@ -87,15 +87,36 @@
         body: JSON.stringify(body)
       });
 
-     if (!resp.ok) {
-  let msg = "Could not estimate.";
+   if (!resp.ok) {
+  let msg = `Request failed (HTTP ${resp.status}).`;
+
   try {
     const err = await resp.json();
-    if (err?.error) msg = err.error;
-    // If Zod validation details exist, show them (very helpful)
-    if (err?.details) msg += " (Some fields are missing or invalid.)";
-  } catch (_) {}
-  out.innerHTML = `<div style="color:#b00;font-size:14px;">${msg}</div>`;
+    if (err?.error) msg += `\n${err.error}`;
+
+    // Show exact field errors from Zod
+    const fe = err?.details?.fieldErrors;
+    if (fe && typeof fe === "object") {
+      msg += "\n\nField errors:";
+      for (const key of Object.keys(fe)) {
+        const problems = fe[key];
+        if (Array.isArray(problems) && problems.length) {
+          msg += `\n- ${key}: ${problems.join(", ")}`;
+        }
+      }
+    } else {
+      // fallback
+      msg += "\n\n(No field details returned.)";
+    }
+  } catch (e) {
+    // If server returned text instead of JSON
+    try {
+      const t = await resp.text();
+      msg += "\n" + t;
+    } catch (_) {}
+  }
+
+  out.innerHTML = `<div style="color:#b00;font-size:13px;white-space:pre-wrap;">${msg}</div>`;
   return;
 }
 

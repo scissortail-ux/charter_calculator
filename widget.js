@@ -87,10 +87,17 @@
         body: JSON.stringify(body)
       });
 
-      if (!resp.ok) {
-        out.innerHTML = `<div style="color:#b00;font-size:14px;">Could not estimate. Check airport codes.</div>`;
-        return;
-      }
+     if (!resp.ok) {
+  let msg = "Could not estimate.";
+  try {
+    const err = await resp.json();
+    if (err?.error) msg = err.error;
+    // If Zod validation details exist, show them (very helpful)
+    if (err?.details) msg += " (Some fields are missing or invalid.)";
+  } catch (_) {}
+  out.innerHTML = `<div style="color:#b00;font-size:14px;">${msg}</div>`;
+  return;
+}
 
       const data = await resp.json();
       out.innerHTML = `

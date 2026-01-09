@@ -122,12 +122,13 @@
 
   function fill(sel, cities) {
     sel.innerHTML = "";
+    // Alphabetical by label in UI (even if server didn’t sort)
     const sorted = [...cities].sort((a, b) => (a.label || "").localeCompare(b.label || ""));
     for (const c of sorted) {
       const opt = document.createElement("option");
-      opt.value = c.cityKey;            // cityKey is still the primary value
+      opt.value = c.cityKey;
       opt.textContent = c.label;
-      opt.dataset.icao = c.icao || "";  // ✅ ICAO fallback for server matching
+      opt.dataset.icao = c.icao || "";
       sel.appendChild(opt);
     }
   }
@@ -141,7 +142,7 @@
     fill(fromSel, cities);
     fill(toSel, cities);
 
-    // Default FROM = Austin (home base)
+    // Default FROM = Austin
     const homeKey = data.homeBaseCityKey || "Austin, TX, US";
     fromSel.value = homeKey;
 
@@ -197,7 +198,9 @@
 
       const data = await resp.json();
       const b = data.breakdown || {};
-      const legs = Array.isArray(b.reposition_legs) ? b.reposition_legs : [];
+      const repoDetail = b.reposition_detail || {};
+      const homeRepoLegs = Array.isArray(repoDetail.home_repo_legs) ? repoDetail.home_repo_legs : [];
+      const marketPos = Array.isArray(repoDetail.market_positioning) ? repoDetail.market_positioning : [];
 
       out.innerHTML = `
         <div style="padding:12px;border:1px solid #eee;border-radius:12px;background:#fafafa;">
@@ -210,23 +213,36 @@
             • Home base: <b>Austin (KAUS)</b>
           </div>
 
+          <div style="margin-top:8px;color:#666;font-size:13px;">
+            Volatility buffer: ±${Math.round((b.volatility_multiplier ?? 0) * 100)}%
+            • Brokerage fees and applicable Federal Excise Tax are included
+          </div>
+
           <details style="margin-top:10px;">
             <summary style="cursor:pointer;font-weight:800;">See breakdown</summary>
             <div style="margin-top:8px;font-size:13px;line-height:1.45;color:#333;">
               <div>Trip hours (est): <b>${b.trip_hours_est ?? "-"}</b></div>
-              <div>Reposition hours (est): <b>${b.reposition_hours_est ?? "-"}</b></div>
+              <div>Reposition/positioning hours (est): <b>${b.reposition_hours_est ?? "-"}</b></div>
               <div>Wait days: <b>${b.wait_days ?? 0}</b></div>
+
               <div style="margin-top:6px;">Fees: <b>${money((b.fees?.low ?? 0))}–${money((b.fees?.high ?? 0))}</b></div>
               <div>Parking/handling: <b>${money((b.parking?.low ?? 0))}–${money((b.parking?.high ?? 0))}</b></div>
+
               <div style="margin-top:8px;color:#666;">
-                Volatility buffer: ±${Math.round((b.volatility_multiplier ?? 0) * 100)}%
-                ${b.markup_pct != null ? ` • Markup: ${Math.round(b.markup_pct * 100)}%` : ""}
+                US FET applied: <b>${b.inclusions?.fet_applied ? "Yes" : "No"}</b>
               </div>
 
-              ${legs.length ? `
-                <div style="margin-top:10px;font-weight:800;">Reposition legs</div>
+              ${homeRepoLegs.length ? `
+                <div style="margin-top:10px;font-weight:800;">Home-base reposition legs</div>
                 <ul style="margin:6px 0 0 18px;padding:0;">
-                  ${legs.map(l => `<li>${l.from} → ${l.to} (${l.distance_nm} nm, ~${l.hours}h)</li>`).join("")}
+                  ${homeRepoLegs.map(l => `<li>${l.from} → ${l.to} (~${l.hours}h)</li>`).join("")}
+                </ul>
+              ` : ""}
+
+              ${marketPos.length ? `
+                <div style="margin-top:10px;font-weight:800;">Market positioning (Austin)</div>
+                <ul style="margin:6px 0 0 18px;padding:0;">
+                  ${marketPos.map(l => `<li>${l.note}: ~${l.hours}h</li>`).join("")}
                 </ul>
               ` : ""}
 
@@ -237,8 +253,12 @@
             </div>
           </details>
 
-          <div style="margin-top:10px;font-size:12px;color:#666;">
-            Budget estimate only. Final pricing depends on availability and routing.
+          <div style="margin-top:12px;font-size:12px;color:#666;line-height:1.4;">
+            <b>Important notes:</b><br>
+            • This tool provides a budgetary estimate only and is not a quote.<br>
+            • If your exact destination isn’t listed, please select the nearest major city/airport.<br>
+            • Final pricing may vary based on aircraft availability, routing, crew duty limits, and handling/parking fees.<br>
+            • International flights may be subject to different taxes and fees.
           </div>
         </div>
       `;

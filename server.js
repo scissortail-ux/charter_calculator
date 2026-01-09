@@ -3,27 +3,40 @@ import cors from "cors";
 import { z } from "zod";
 
 /**
- * Charter Calculator API (v2)
- * - Default home base: Austin (KAUS)
- * - City-based inputs (no airport codes in UI)
+ * Charter Calculator API (v3)
+ * - City-based (UI uses city names)
+ * - Home base: Austin (KAUS) reposition logic
+ * - Round-trip supported
+ * - No standby/daily minimum billing; instead small parking allowance + volatility
  * - Aircraft class dropdown + pax filtering
- * - Round trips
- * - Reposition legs (KAUS-based) instead of big overnight fees / daily mins
+ * - Works for every route between cities in the dataset
  */
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ------------------------------ Constants ------------------------------ */
+/* ------------------------------ Config ------------------------------ */
 
-const HOME_BASE_ICAO = "KAUS";
 const HOME_BASE_CITY_KEY = "Austin, TX, US";
+const HOME_BASE_ICAO = "KAUS";
 
-/** Aircraft classes (ordered) */
+// Optional markup for client-facing numbers (set to 0 for pure wholesale).
+// You can change this anytime without changing code by setting in Render env vars.
+const DEFAULT_MARKUP_PCT = Number(process.env.MARKUP_PCT ?? "0.2"); // 20% default
+
+/* ------------------------------ Aircraft ------------------------------ */
+
 const AIRCRAFT_CLASSES = ["TURBOPROP", "LIGHT_JET", "MIDSIZE", "SUPER_MID", "HEAVY_JET"];
 
-/** Typical cruise speeds (knots) */
+const CLASS_LABELS = {
+  TURBOPROP: "Turboprop",
+  LIGHT_JET: "Light Jet",
+  MIDSIZE: "Midsize Jet",
+  SUPER_MID: "Super-Mid Jet",
+  HEAVY_JET: "Heavy Jet",
+};
+
 const CRUISE_SPEED_KTS = {
   TURBOPROP: 280,
   LIGHT_JET: 420,
@@ -32,7 +45,7 @@ const CRUISE_SPEED_KTS = {
   HEAVY_JET: 500,
 };
 
-/** Typical max practical range (nautical miles) — conservative */
+// Conservative “range” for forcing class upgrades
 const MAX_RANGE_NM = {
   TURBOPROP: 900,
   LIGHT_JET: 1500,
@@ -41,18 +54,21 @@ const MAX_RANGE_NM = {
   HEAVY_JET: 6000,
 };
 
-/** Hourly rate bands (USD / flight hour). Adjust to your market. */
+/**
+ * Wholesale-ish hourly bands (tuned down vs earlier to better match Avinode wholesale behavior).
+ * These are still “market bands” and will vary by season/availability.
+ */
 const RATE_TABLE = {
-  TURBOPROP: { low: 2200, high: 3200 },
-  LIGHT_JET: { low: 3500, high: 5200 },
-  MIDSIZE: { low: 5600, high: 7800 },
-  SUPER_MID: { low: 7800, high: 10500 },
-  HEAVY_JET: { low: 10500, high: 17000 },
+  TURBOPROP: { low: 2100, high: 3000 },
+  LIGHT_JET: { low: 3200, high: 4300 },
+  MIDSIZE: { low: 5200, high: 7200 },
+  SUPER_MID: { low: 7200, high: 9800 },
+  HEAVY_JET: { low: 9800, high: 15500 },
 };
 
 /**
- * Regional per-landing allowance (very simplified).
- * These cover handling/landing-ish costs (broad).
+ * Regional landing/handling allowance per stop (broad).
+ * (Stops = number of landings at destination(s): 1 one-way, 2 round trip.)
  */
 const REGION_FEE_PER_STOP = {
   US: { low: 600, high: 1200 },
@@ -60,18 +76,25 @@ const REGION_FEE_PER_STOP = {
 };
 
 /**
- * Reposition factor assumptions:
- * - You said “factor reposition legs rather than substantial overnight fees/daily mins”.
- * - We’ll model reposition as extra flight legs from/to HOME BASE depending on where the trip starts/ends.
- * - We also add a small “availability friction” buffer by city tier (major hub vs smaller city).
+ * Parking/handling allowance per “wait day” on round-trips (instead of billing standby flight hours).
+ * This is intentionally modest.
  */
-const CITY_TIER_REPOSITION_HOURS = {
-  major: 0.4, // additional hours (planning, ATC, reposition inefficiency)
-  large: 0.6,
-  mid: 0.8,
+const PARKING_PER_DAY = {
+  US: { low: 150, high: 450 },
+  MEXICO: { low: 250, high: 650 },
 };
 
-/** Volatility multipliers by risk score */
+/**
+ * City-tier friction: captures typical “availability / reposition inefficiency”
+ * without over-billing overnight fees.
+ */
+const CITY_TIER_REPO_HOURS = {
+  major: 0.35,
+  large: 0.55,
+  mid: 0.75,
+};
+
+/** Volatility multipliers (range width) */
 const VOLATILITY = {
   0: 0.10,
   1: 0.15,
@@ -80,20 +103,19 @@ const VOLATILITY = {
   "4+": 0.35,
 };
 
-/* ------------------------------ City Data ------------------------------ */
+/* ------------------------------ Cities ------------------------------ */
 /**
- * We use “city names” in UI, but compute from a representative airport per city.
- * This list is intentionally “major cities” in US + Mexico (expand anytime).
- * cityKey must be unique.
+ * UI uses cityKey; pricing uses representative airport/lat/lon.
+ * Add more cities by appending objects with cityKey/icao/lat/lon.
  */
 const CITIES = [
-  // --- Texas & nearby anchors ---
+  // --- Home base + Texas anchors ---
   { cityKey: "Austin, TX, US", city: "Austin", region: "TX", country: "US", icao: "KAUS", lat: 30.2025, lon: -97.6664, tier: "major" },
   { cityKey: "Dallas, TX, US", city: "Dallas", region: "TX", country: "US", icao: "KDAL", lat: 32.8471, lon: -96.8517, tier: "major" },
   { cityKey: "Houston, TX, US", city: "Houston", region: "TX", country: "US", icao: "KHOU", lat: 29.6454, lon: -95.2789, tier: "major" },
   { cityKey: "San Antonio, TX, US", city: "San Antonio", region: "TX", country: "US", icao: "KSAT", lat: 29.5337, lon: -98.4698, tier: "large" },
 
-  // --- Major US cities ---
+  // --- Major US (business + leisure) ---
   { cityKey: "New York, NY, US", city: "New York", region: "NY", country: "US", icao: "KTEB", lat: 40.8501, lon: -74.0608, tier: "major" },
   { cityKey: "Los Angeles, CA, US", city: "Los Angeles", region: "CA", country: "US", icao: "KLAX", lat: 33.9416, lon: -118.4085, tier: "major" },
   { cityKey: "San Francisco, CA, US", city: "San Francisco", region: "CA", country: "US", icao: "KSFO", lat: 37.6213, lon: -122.3790, tier: "major" },
@@ -109,29 +131,29 @@ const CITIES = [
   { cityKey: "Denver, CO, US", city: "Denver", region: "CO", country: "US", icao: "KDEN", lat: 39.8561, lon: -104.6737, tier: "major" },
   { cityKey: "Phoenix, AZ, US", city: "Phoenix", region: "AZ", country: "US", icao: "KPHX", lat: 33.4342, lon: -112.0116, tier: "major" },
   { cityKey: "Las Vegas, NV, US", city: "Las Vegas", region: "NV", country: "US", icao: "KLAS", lat: 36.0840, lon: -115.1537, tier: "major" },
+
+  // --- Midwest / East / South business ---
+  { cityKey: "Detroit (City), MI, US", city: "Detroit (City)", region: "MI", country: "US", icao: "KDET", lat: 42.4092, lon: -83.0099, tier: "large" },
+  { cityKey: "Minneapolis, MN, US", city: "Minneapolis", region: "MN", country: "US", icao: "KMSP", lat: 44.8848, lon: -93.2223, tier: "major" },
   { cityKey: "Nashville, TN, US", city: "Nashville", region: "TN", country: "US", icao: "KBNA", lat: 36.1245, lon: -86.6782, tier: "large" },
   { cityKey: "Charlotte, NC, US", city: "Charlotte", region: "NC", country: "US", icao: "KCLT", lat: 35.2140, lon: -80.9431, tier: "large" },
-  { cityKey: "Minneapolis, MN, US", city: "Minneapolis", region: "MN", country: "US", icao: "KMSP", lat: 44.8848, lon: -93.2223, tier: "major" },
-  { cityKey: "Detroit, MI, US", city: "Detroit", region: "MI", country: "US", icao: "KDTW", lat: 42.2162, lon: -83.3554, tier: "large" },
-  { cityKey: "New Orleans, LA, US", city: "New Orleans", region: "LA", country: "US", icao: "KMSY", lat: 29.9934, lon: -90.2580, tier: "large" },
-  { cityKey: "Salt Lake City, UT, US", city: "Salt Lake City", region: "UT", country: "US", icao: "KSLC", lat: 40.7899, lon: -111.9791, tier: "large" },
-  { cityKey: "Portland, OR, US", city: "Portland", region: "OR", country: "US", icao: "KPDX", lat: 45.5898, lon: -122.5951, tier: "large" },
   { cityKey: "Philadelphia, PA, US", city: "Philadelphia", region: "PA", country: "US", icao: "KPHL", lat: 39.8744, lon: -75.2424, tier: "large" },
+  { cityKey: "Tampa, FL, US", city: "Tampa", region: "FL", country: "US", icao: "KTPA", lat: 27.9755, lon: -82.5332, tier: "large" },
+  { cityKey: "New Orleans, LA, US", city: "New Orleans", region: "LA", country: "US", icao: "KMSY", lat: 29.9934, lon: -90.2580, tier: "large" },
 
-  // --- Mexico major cities / resorts ---
+  // --- Mexico major ---
   { cityKey: "Mexico City, MX, MX", city: "Mexico City", region: "MX", country: "MX", icao: "MMMX", lat: 19.4361, lon: -99.0719, tier: "major" },
   { cityKey: "Guadalajara, JA, MX", city: "Guadalajara", region: "JA", country: "MX", icao: "MMGL", lat: 20.5218, lon: -103.3112, tier: "large" },
   { cityKey: "Monterrey, NL, MX", city: "Monterrey", region: "NL", country: "MX", icao: "MMMY", lat: 25.7785, lon: -100.1070, tier: "large" },
   { cityKey: "Cancún, QR, MX", city: "Cancún", region: "QR", country: "MX", icao: "MMUN", lat: 21.0365, lon: -86.8771, tier: "major" },
   { cityKey: "Puerto Vallarta, JA, MX", city: "Puerto Vallarta", region: "JA", country: "MX", icao: "MMPR", lat: 20.6801, lon: -105.2542, tier: "large" },
   { cityKey: "Los Cabos, BS, MX", city: "Los Cabos", region: "BS", country: "MX", icao: "MMSD", lat: 23.1518, lon: -109.7210, tier: "major" },
-  { cityKey: "Tijuana, BC, MX", city: "Tijuana", region: "BC", country: "MX", icao: "MMTJ", lat: 32.5411, lon: -116.9700, tier: "large" },
 ];
 
-/* ------------------------------ Utilities ------------------------------ */
+/* ------------------------------ Helpers ------------------------------ */
 
 function findCity(cityKey) {
-  return CITIES.find(c => c.cityKey === cityKey);
+  return CITIES.find((c) => c.cityKey === cityKey);
 }
 
 function toRadians(deg) {
@@ -147,13 +169,11 @@ function haversineNm(a, b) {
 
   const sinDLat = Math.sin(dLat / 2);
   const sinDLon = Math.sin(dLon / 2);
-
   const h = sinDLat * sinDLat + Math.cos(lat1) * Math.cos(lat2) * sinDLon * sinDLon;
   const c = 2 * Math.asin(Math.min(1, Math.sqrt(h)));
 
   const distanceKm = R_km * c;
-  const nmPerKm = 0.539957;
-  return distanceKm * nmPerKm;
+  return distanceKm * 0.539957;
 }
 
 function roundDownTo(x, step = 1000) {
@@ -171,7 +191,7 @@ function clampInt(n, min, max) {
 
 function isWeekend(dateISO) {
   const d = new Date(dateISO);
-  const day = d.getUTCDay(); // 0 Sun ... 6 Sat
+  const day = d.getUTCDay();
   return day === 0 || day === 5 || day === 6;
 }
 
@@ -183,33 +203,23 @@ function dayDiffUTC(depISO, retISO) {
   return Math.round((retDay - depDay) / (24 * 3600 * 1000));
 }
 
-/* -------------------------- Business Logic ----------------------------- */
+/* ------------------------------ Business Logic ------------------------------ */
 
-function regionOfTrip(fromCity, toCity) {
-  // If either endpoint is Mexico, treat as Mexico ops for allowance
-  if (fromCity.country === "MX" || toCity.country === "MX") return "MEXICO";
-  return "US";
+function tripRegion(fromCity, toCity) {
+  return (fromCity.country === "MX" || toCity.country === "MX") ? "MEXICO" : "US";
 }
 
-/**
- * Passenger-based allowed classes:
- * - Prevent light jets for 12 pax, etc.
- */
 function allowedClassesForPax(pax) {
   if (pax <= 4) return ["TURBOPROP", "LIGHT_JET", "MIDSIZE", "SUPER_MID", "HEAVY_JET"];
   if (pax <= 6) return ["LIGHT_JET", "MIDSIZE", "SUPER_MID", "HEAVY_JET"];
   if (pax <= 8) return ["MIDSIZE", "SUPER_MID", "HEAVY_JET"];
   if (pax <= 10) return ["SUPER_MID", "HEAVY_JET"];
-  return ["HEAVY_JET"]; // 11–30: force heavy
+  return ["HEAVY_JET"];
 }
 
-/**
- * If user picks a class that can’t fly the distance, upgrade automatically.
- */
 function ensureRangeClass(requestedClass, distanceNm) {
   let idx = AIRCRAFT_CLASSES.indexOf(requestedClass);
   if (idx < 0) idx = 0;
-
   while (idx < AIRCRAFT_CLASSES.length) {
     const cls = AIRCRAFT_CLASSES[idx];
     if (distanceNm <= MAX_RANGE_NM[cls]) return cls;
@@ -222,62 +232,57 @@ function estimateLegBlockHours(distanceNm, aircraftClass) {
   const speed = CRUISE_SPEED_KTS[aircraftClass];
   const flightHours = distanceNm / speed;
 
-  // Base buffer: taxi/climb/descent
-  let buffer = 0.4;
-
-  // Add a small extra buffer for longer legs
-  if (distanceNm > 1200) buffer += 0.2;
+  // realistic fixed buffer, plus a touch for longer legs
+  let buffer = 0.42;
+  if (distanceNm > 1200) buffer += 0.18;
 
   return flightHours + buffer;
 }
 
+function tierFrictionHours(city) {
+  return CITY_TIER_REPO_HOURS[city.tier] ?? 0.6;
+}
+
 /**
- * Reposition legs:
- * - If trip starts at KAUS: no pre-repo.
- * - If trip starts elsewhere: add KAUS -> origin repo.
- * - If one-way ending not KAUS: add destination -> KAUS repo.
- * - If round trip and origin not KAUS: still repo both ends (aircraft must get to/from start city).
- *
- * Also add tier friction (major/large/mid).
+ * KAUS reposition model:
+ * - If trip starts away from KAUS, add KAUS->origin repo
+ * - If trip ends away from KAUS (one-way) OR ends away from KAUS (round-trip returns to origin), add end->KAUS repo
  */
-function estimateRepositionHours(fromCity, toCity, aircraftClass, isRoundTrip) {
+function estimateReposition(fromCity, toCity, aircraftClass, isRoundTrip) {
   const home = findCity(HOME_BASE_CITY_KEY);
   if (!home) return { hours: 0, legs: [] };
 
   const legs = [];
-  let repoHours = 0;
+  let hours = 0;
 
-  const tierFriction = (city) => CITY_TIER_REPOSITION_HOURS[city.tier] ?? 0.6;
-
-  // Pre reposition to start
+  // Pre-repo to origin
   if (fromCity.icao !== HOME_BASE_ICAO) {
     const d = haversineNm(home, fromCity);
-    const h = estimateLegBlockHours(d, aircraftClass) + tierFriction(fromCity);
-    legs.push({ from: home.cityKey, to: fromCity.cityKey, distance_nm: Math.round(d), hours: roundUpTo(h * 10, 1) / 10 });
-    repoHours += h;
+    const h = estimateLegBlockHours(d, aircraftClass) + tierFrictionHours(fromCity);
+    legs.push({ from: home.cityKey, to: fromCity.cityKey, distance_nm: Math.round(d), hours: Math.round(h * 10) / 10 });
+    hours += h;
   }
 
-  // Post reposition home (end state depends on trip type)
-  // - One-way: ends at destination -> reposition dest -> home
-  // - Round-trip: ends back at origin city, so reposition origin -> home if origin isn't home
+  // Post-repo back to home
   const endCity = isRoundTrip ? fromCity : toCity;
   if (endCity.icao !== HOME_BASE_ICAO) {
     const d = haversineNm(endCity, home);
-    const h = estimateLegBlockHours(d, aircraftClass) + tierFriction(endCity);
-    legs.push({ from: endCity.cityKey, to: home.cityKey, distance_nm: Math.round(d), hours: roundUpTo(h * 10, 1) / 10 });
-    repoHours += h;
+    const h = estimateLegBlockHours(d, aircraftClass) + tierFrictionHours(endCity);
+    legs.push({ from: endCity.cityKey, to: home.cityKey, distance_nm: Math.round(d), hours: Math.round(h * 10) / 10 });
+    hours += h;
   }
 
-  return { hours: repoHours, legs };
+  return { hours, legs };
 }
 
-function computeRiskScore({ departDateISO, tripRegion, pax, distanceNm, isRoundTrip }) {
+function computeRiskScore({ departDateISO, region, pax, oneWayDistanceNm, isRoundTrip, waitDays }) {
   let risk = 0;
   if (isWeekend(departDateISO)) risk += 1;
-  if (tripRegion === "MEXICO") risk += 1;
-  if (distanceNm > 1200) risk += 1;
+  if (region === "MEXICO") risk += 1;
+  if (oneWayDistanceNm > 1200) risk += 1;
   if (pax >= 10) risk += 1;
   if (isRoundTrip) risk += 1;
+  if (waitDays >= 2) risk += 1;
   return risk;
 }
 
@@ -289,51 +294,35 @@ function riskToMultiplier(risk) {
   return VOLATILITY["4+"];
 }
 
-/**
- * Optional “standby” cost for multi-day round trips (aircraft waits).
- * You requested “rather than substantial overnight fees/daily mins”.
- * We keep this modest and transparent:
- * - If return date > depart date: add 0.8–1.2 billable hours per “wait day”
- * This can be tuned later.
- */
-function estimateStandbyHours(depISO, retISO) {
-  if (!retISO) return { low: 0, high: 0, days: 0 };
-  const diff = dayDiffUTC(depISO, retISO);
-  if (diff <= 0) return { low: 0, high: 0, days: 0 };
-  const days = diff; // e.g., depart 1/10 return 1/13 => 3 wait days
-  return { low: days * 0.8, high: days * 1.2, days };
-}
-
-/* ------------------------------ API Types ------------------------------ */
+/* ------------------------------ API Schema ------------------------------ */
 
 const EstimateRequestSchema = z.object({
   fromCityKey: z.string().min(3),
   toCityKey: z.string().min(3),
-  departDateISO: z.string().min(8), // YYYY-MM-DD from <input type="date">
+  departDateISO: z.string().min(8), // YYYY-MM-DD
   isRoundTrip: z.boolean(),
   returnDateISO: z.string().nullable().optional(),
   pax: z.number().int().min(1).max(30),
-  preferredClass: z
-    .enum(["AUTO", "TURBOPROP", "LIGHT_JET", "MIDSIZE", "SUPER_MID", "HEAVY_JET"])
-    .default("AUTO"),
+  preferredClass: z.enum(["AUTO", "TURBOPROP", "LIGHT_JET", "MIDSIZE", "SUPER_MID", "HEAVY_JET"]).default("AUTO"),
 });
 
-/* -------------------------------- Routes -------------------------------- */
+/* ------------------------------ Routes ------------------------------ */
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.get("/cities", (_req, res) => {
-  // send display-friendly items
-  const list = CITIES.map(c => ({
-    cityKey: c.cityKey,
-    label: `${c.city}${c.region ? ", " + c.region : ""} (${c.country})`,
-    country: c.country,
-    icao: c.icao,
-  }));
+  const cities = CITIES
+    .map((c) => ({
+      cityKey: c.cityKey,
+      label: `${c.city}${c.region ? ", " + c.region : ""} (${c.country})`,
+      country: c.country,
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+
   res.json({
     homeBaseCityKey: HOME_BASE_CITY_KEY,
     homeBaseIcao: HOME_BASE_ICAO,
-    cities: list,
+    cities,
   });
 });
 
@@ -346,127 +335,139 @@ app.post("/estimate", (req, res) => {
   const input = parsed.data;
   const fromCity = findCity(input.fromCityKey);
   const toCity = findCity(input.toCityKey);
+
   if (!fromCity || !toCity) {
-    return res.status(400).json({ error: "Unknown city selection. Please choose from the dropdown list." });
+    return res.status(400).json({ error: "Unknown city. Please choose from the dropdown list." });
   }
 
   const pax = clampInt(input.pax, 1, 30);
 
-  // Main trip distance (one-way)
-  const tripDistanceNm = haversineNm(fromCity, toCity);
+  const oneWayDistanceNm = haversineNm(fromCity, toCity);
+  const region = tripRegion(fromCity, toCity);
 
-  // Determine allowed classes by pax
+  // Allowed by pax
   const allowed = allowedClassesForPax(pax);
 
-  // Determine requested class
-  let chosen = input.preferredClass === "AUTO"
-    ? allowed[0] // start at smallest allowed for pax
-    : input.preferredClass;
+  // Choose class
+  let chosen =
+    input.preferredClass === "AUTO"
+      ? allowed[0] // smallest allowed for pax
+      : input.preferredClass;
 
-  // If user chose an invalid class for pax, fail fast (UX is filtering too, but be safe)
   if (!allowed.includes(chosen)) {
     return res.status(400).json({
-      error: "Selected aircraft class is not valid for the passenger count.",
+      error: "Selected class not allowed for passenger count.",
       details: { allowedClasses: allowed },
     });
   }
 
-  // Ensure range capability by upgrading class if needed
-  const classAfterRange = ensureRangeClass(chosen, tripDistanceNm);
-  if (!allowed.includes(classAfterRange)) {
-    // If range forces an upgrade beyond pax-allowed list, go to the smallest pax-allowed that can do range
-    const upgraded = allowed.find(cls => tripDistanceNm <= MAX_RANGE_NM[cls]) || "HEAVY_JET";
-    chosen = upgraded;
-  } else {
-    chosen = classAfterRange;
+  // Ensure range capability (upgrade class if needed)
+  chosen = ensureRangeClass(chosen, oneWayDistanceNm);
+
+  // If upgrade pushes outside pax-allowed, bump to the smallest pax-allowed class that can do the range
+  if (!allowed.includes(chosen)) {
+    chosen = allowed.find((cls) => oneWayDistanceNm <= MAX_RANGE_NM[cls]) || "HEAVY_JET";
   }
 
-  const tripRegion = regionOfTrip(fromCity, toCity);
-
-  // Legs: trip itself
+  // Trip legs/hours
   const tripLegs = input.isRoundTrip ? 2 : 1;
-  const legBlock = estimateLegBlockHours(tripDistanceNm, chosen);
-  const tripHours = legBlock * tripLegs;
+  const tripLegHours = estimateLegBlockHours(oneWayDistanceNm, chosen);
+  const tripHours = tripLegHours * tripLegs;
 
-  // Reposition hours/legs (KAUS-based)
-  const repo = estimateRepositionHours(fromCity, toCity, chosen, input.isRoundTrip);
+  // Wait days (for parking allowance only)
+  let waitDays = 0;
+  if (input.isRoundTrip && input.returnDateISO) {
+    waitDays = Math.max(0, dayDiffUTC(input.departDateISO, input.returnDateISO));
+  }
 
-  // Standby hours for multi-day round trips (modest, not big daily minimums)
-  const standby = input.isRoundTrip ? estimateStandbyHours(input.departDateISO, input.returnDateISO) : { low: 0, high: 0, days: 0 };
+  // Reposition legs/hours from KAUS
+  const repo = estimateReposition(fromCity, toCity, chosen, input.isRoundTrip);
 
-  // Fees (per landing)
+  // Fees
   const stops = input.isRoundTrip ? 2 : 1;
-  const feeBand = tripRegion === "MEXICO" ? REGION_FEE_PER_STOP.MEXICO : REGION_FEE_PER_STOP.US;
+  const feeBand = region === "MEXICO" ? REGION_FEE_PER_STOP.MEXICO : REGION_FEE_PER_STOP.US;
   const fees = { low: stops * feeBand.low, high: stops * feeBand.high };
 
-  // Base charter
+  // Parking allowance for wait days
+  const parkBand = region === "MEXICO" ? PARKING_PER_DAY.MEXICO : PARKING_PER_DAY.US;
+  const parking = { low: waitDays * parkBand.low, high: waitDays * parkBand.high };
+
+  // Base charter (hours * hourly band)
   const rate = RATE_TABLE[chosen];
-  const billableHoursLow = tripHours + repo.hours + standby.low;
-  const billableHoursHigh = tripHours + repo.hours + standby.high;
+  const billableHours = tripHours + repo.hours;
 
   const base = {
-    low: billableHoursLow * rate.low,
-    high: billableHoursHigh * rate.high,
+    low: billableHours * rate.low,
+    high: billableHours * rate.high,
   };
 
   const subtotal = {
-    low: base.low + fees.low,
-    high: base.high + fees.high,
+    low: base.low + fees.low + parking.low,
+    high: base.high + fees.high + parking.high,
   };
 
+  // Volatility width (route-agnostic)
   const risk = computeRiskScore({
     departDateISO: input.departDateISO,
-    tripRegion,
+    region,
     pax,
-    distanceNm: tripDistanceNm,
+    oneWayDistanceNm,
     isRoundTrip: input.isRoundTrip,
+    waitDays,
   });
 
   const mult = riskToMultiplier(risk);
-  const estimateLow = roundDownTo(subtotal.low * (1 - mult), 1000);
-  const estimateHigh = roundUpTo(subtotal.high * (1 + mult), 1000);
+
+  let estimateLow = roundDownTo(subtotal.low * (1 - mult), 1000);
+  let estimateHigh = roundUpTo(subtotal.high * (1 + mult), 1000);
+
+  // Apply optional markup for client-facing all-in
+  const markup = Math.max(0, Math.min(0.50, DEFAULT_MARKUP_PCT)); // cap for safety
+  if (markup > 0) {
+    estimateLow = roundDownTo(estimateLow * (1 + markup), 1000);
+    estimateHigh = roundUpTo(estimateHigh * (1 + markup), 1000);
+  }
 
   return res.json({
     currency: "USD",
     home_base: { cityKey: HOME_BASE_CITY_KEY, icao: HOME_BASE_ICAO },
-    input: { ...input, pax, resolvedClass: chosen },
-    allowed_classes: allowed,
-    trip: {
-      from: fromCity.cityKey,
-      to: toCity.cityKey,
-      region: tripRegion,
-      distance_nm_one_way: Math.round(tripDistanceNm),
-      round_trip: input.isRoundTrip,
-      legs: tripLegs,
-    },
     estimate_low: Math.max(0, estimateLow),
     estimate_high: Math.max(estimateLow + 1000, estimateHigh),
-    confidence: tripRegion === "MEXICO" ? "MEDIUM" : "HIGH",
+    confidence: region === "MEXICO" ? "MEDIUM" : "HIGH",
     breakdown: {
+      mode: markup > 0 ? "CLIENT_ALL_IN" : "WHOLESALE",
+      markup_pct: markup,
+      region,
+      from: fromCity.cityKey,
+      to: toCity.cityKey,
+      pax,
       aircraft_class: chosen,
-      hourly_rate_band: rate,
+      aircraft_label: CLASS_LABELS[chosen],
+      one_way_distance_nm: Math.round(oneWayDistanceNm),
+      trip_legs: tripLegs,
       trip_hours_est: Math.round(tripHours * 10) / 10,
       reposition_hours_est: Math.round(repo.hours * 10) / 10,
       reposition_legs: repo.legs,
-      standby_days: standby.days,
-      standby_hours_est: { low: Math.round(standby.low * 10) / 10, high: Math.round(standby.high * 10) / 10 },
+      wait_days: waitDays,
       fees,
+      parking,
+      hourly_rate_band: rate,
       subtotal,
       volatility_multiplier: mult,
       assumptions: [
         "Estimate only (not a quote).",
-        `Home base assumed: Austin (KAUS). Reposition legs included when trip starts/ends away from KAUS.`,
-        "Airport/handling/government costs are estimated via regional allowance.",
-        "Standby (multi-day round trips) is modeled modestly as aircraft hold time (not hotel/crew per diems).",
+        "Reposition legs are modeled from/to Austin (KAUS) rather than billing large overnight/daily minimums.",
+        "Multi-day round-trips use modest parking/handling allowances (not standby flight-hour billing).",
+        "Market pricing varies by availability, operator, and routing.",
       ],
       may_change: [
-        "Aircraft availability and actual reposition routing",
-        "Airport handling/parking fees (especially Mexico)",
-        "Weather and ATC routing",
+        "Actual reposition routing & availability",
+        "Handling/parking fees (especially Mexico)",
+        "Weather/ATC routing and time-of-day constraints",
       ],
     },
   });
 });
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
-app.listen(PORT, () => console.log(`Charter Calculator API (v2) running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Charter Calculator API (v3) running on port ${PORT}`));

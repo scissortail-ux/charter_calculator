@@ -3,13 +3,13 @@ import cors from "cors";
 import { z } from "zod";
 
 /**
- * Charter Calculator API (v3.1)
- * - City dropdown list alphabetical
- * - Robust city resolution: accepts cityKey OR ICAO (prevents "Unknown city" due to label mismatch)
- * - Home base: Austin (KAUS) with reposition legs
- * - Round trip supported
- * - No standby/daily minimum billing; modest parking per wait day + volatility
- * - +20% markup (margin + FET) via MARKUP_PCT env var (defaults to 0.20)
+ * Charter Calculator API (v3.2)
+ * Fixes accuracy gap vs Avinode:
+ * 1) Volatility should widen upward, not discount the low end.
+ * 2) Add expected positioning allowance even when trip starts/ends at KAUS
+ *    (market aircraft may not be based at KAUS, Avinode shows "Pos." times).
+ * 3) City list alphabetical and robust city resolution (cityKey OR ICAO).
+ * 4) 20% markup (margin + FET) default.
  */
 
 const app = express();
@@ -20,8 +20,6 @@ app.use(express.json());
 
 const HOME_BASE_CITY_KEY = "Austin, TX, US";
 const HOME_BASE_ICAO = "KAUS";
-
-// 20% markup by default (margin + FET). Override in Render env vars.
 const DEFAULT_MARKUP_PCT = Number(process.env.MARKUP_PCT ?? "0.20"); // 20% default
 
 /* ------------------------------ Aircraft ------------------------------ */
@@ -52,10 +50,7 @@ const MAX_RANGE_NM = {
   HEAVY_JET: 6000,
 };
 
-/**
- * Wholesale-ish hourly bands (tuned toward Avinode wholesale ranges).
- * You can calibrate over time with more sample routes.
- */
+// Wholesale-ish hourly bands (tuned toward Avinode wholesale ranges)
 const RATE_TABLE = {
   TURBOPROP: { low: 2100, high: 3000 },
   LIGHT_JET: { low: 3200, high: 4300 },
@@ -79,6 +74,24 @@ const CITY_TIER_REPO_HOURS = {
   large: 0.55,
   mid: 0.75,
 };
+
+/**
+ * Expected “market positioning” (NOT home-base repo):
+ * Even if trip starts at KAUS, the actual aircraft you source often repositions in/out.
+ * This is a *key* reason Avinode wholesale is higher than a naive “trip hours only” model.
+ *
+ * Tuned so AUS–DET–AUS light jet is no longer ~18k wholesale.
+ * (You can calibrate these with more Avinode samples over time.)
+ */
+const EXPECTED_POS_IN_HOURS = {
+  TURBOPROP: 0.9,
+  LIGHT_JET: 1.2,
+  MIDSIZE: 1.1,
+  SUPER_MID: 1.0,
+  HEAVY_JET: 0.9,
+};
+// outbound pos tends to be a bit smaller than inbound on average
+const EXPECTED_POS_OUT_MULT = 0.5;
 
 const VOLATILITY = {
   0: 0.10,
@@ -135,50 +148,40 @@ const CITIES = [
 function findCityByKey(cityKey) {
   return CITIES.find((c) => c.cityKey === cityKey);
 }
-
 function findCityByIcao(icao) {
   const code = String(icao || "").trim().toUpperCase();
   return CITIES.find((c) => c.icao === code);
 }
-
 function toRadians(deg) {
   return (deg * Math.PI) / 180;
 }
-
 function haversineNm(a, b) {
   const R_km = 6371;
   const dLat = toRadians(b.lat - a.lat);
   const dLon = toRadians(b.lon - a.lon);
   const lat1 = toRadians(a.lat);
-  const lat2 = toRadians(b.lat);
-
+  const lat2 = toRadians(a.lat + (b.lat - a.lat));
   const sinDLat = Math.sin(dLat / 2);
   const sinDLon = Math.sin(dLon / 2);
-  const h = sinDLat * sinDLat + Math.cos(lat1) * Math.cos(lat2) * sinDLon * sinDLon;
+  const h = sinDLat * sinDLat + Math.cos(lat1) * Math.cos(toRadians(b.lat)) * sinDLon * sinDLon;
   const c = 2 * Math.asin(Math.min(1, Math.sqrt(h)));
-
   return (R_km * c) * 0.539957;
 }
-
 function roundDownTo(x, step = 1000) {
   return Math.floor(x / step) * step;
 }
-
 function roundUpTo(x, step = 1000) {
   return Math.ceil(x / step) * step;
 }
-
 function clampInt(n, min, max) {
   const v = Number.isFinite(n) ? Math.trunc(n) : min;
   return Math.max(min, Math.min(max, v));
 }
-
 function isWeekend(dateISO) {
   const d = new Date(dateISO);
   const day = d.getUTCDay();
   return day === 0 || day === 5 || day === 6;
 }
-
 function dayDiffUTC(depISO, retISO) {
   const dep = new Date(depISO);
   const ret = new Date(retISO);
@@ -192,7 +195,6 @@ function dayDiffUTC(depISO, retISO) {
 function tripRegion(fromCity, toCity) {
   return (fromCity.country === "MX" || toCity.country === "MX") ? "MEXICO" : "US";
 }
-
 function allowedClassesForPax(pax) {
   if (pax <= 4) return ["TURBOPROP", "LIGHT_JET", "MIDSIZE", "SUPER_MID", "HEAVY_JET"];
   if (pax <= 6) return ["LIGHT_JET", "MIDSIZE", "SUPER_MID", "HEAVY_JET"];
@@ -200,11 +202,9 @@ function allowedClassesForPax(pax) {
   if (pax <= 10) return ["SUPER_MID", "HEAVY_JET"];
   return ["HEAVY_JET"];
 }
-
 function ensureRangeClass(requestedClass, distanceNm) {
   let idx = AIRCRAFT_CLASSES.indexOf(requestedClass);
   if (idx < 0) idx = 0;
-
   while (idx < AIRCRAFT_CLASSES.length) {
     const cls = AIRCRAFT_CLASSES[idx];
     if (distanceNm <= MAX_RANGE_NM[cls]) return cls;
@@ -212,44 +212,82 @@ function ensureRangeClass(requestedClass, distanceNm) {
   }
   return "HEAVY_JET";
 }
-
 function estimateLegBlockHours(distanceNm, aircraftClass) {
   const speed = CRUISE_SPEED_KTS[aircraftClass];
   const flightHours = distanceNm / speed;
-
-  // realistic fixed buffer, plus a touch for longer legs
   let buffer = 0.42;
   if (distanceNm > 1200) buffer += 0.18;
-
   return flightHours + buffer;
 }
-
 function tierFrictionHours(city) {
   return CITY_TIER_REPO_HOURS[city.tier] ?? 0.6;
 }
 
-function estimateReposition(fromCity, toCity, aircraftClass, isRoundTrip) {
+/**
+ * Hard repo from/to HOME BASE (used when trip starts/ends away from KAUS).
+ */
+function estimateHomeBaseReposition(fromCity, toCity, aircraftClass, isRoundTrip) {
   const home = findCityByKey(HOME_BASE_CITY_KEY);
   if (!home) return { hours: 0, legs: [] };
 
   const legs = [];
   let hours = 0;
 
-  // Pre-repo to origin
+  // Pre-repo to origin if origin is not KAUS
   if (fromCity.icao !== HOME_BASE_ICAO) {
     const d = haversineNm(home, fromCity);
     const h = estimateLegBlockHours(d, aircraftClass) + tierFrictionHours(fromCity);
-    legs.push({ from: home.cityKey, to: fromCity.cityKey, fromIcao: home.icao, toIcao: fromCity.icao, distance_nm: Math.round(d), hours: Math.round(h * 10) / 10 });
+    legs.push({ type: "HOME_REPO", from: home.cityKey, to: fromCity.cityKey, distance_nm: Math.round(d), hours: Math.round(h * 10) / 10 });
     hours += h;
   }
 
-  // Post-repo back to home
+  // Post-repo back to KAUS
   const endCity = isRoundTrip ? fromCity : toCity;
   if (endCity.icao !== HOME_BASE_ICAO) {
     const d = haversineNm(endCity, home);
     const h = estimateLegBlockHours(d, aircraftClass) + tierFrictionHours(endCity);
-    legs.push({ from: endCity.cityKey, to: home.cityKey, fromIcao: endCity.icao, toIcao: home.icao, distance_nm: Math.round(d), hours: Math.round(h * 10) / 10 });
+    legs.push({ type: "HOME_REPO", from: endCity.cityKey, to: home.cityKey, distance_nm: Math.round(d), hours: Math.round(h * 10) / 10 });
     hours += h;
+  }
+
+  return { hours, legs };
+}
+
+/**
+ * Expected positioning even when origin = KAUS.
+ * This approximates the fact that sourced aircraft often reposition in/out
+ * (Avinode "Pos." time).
+ */
+function estimateExpectedMarketPositioningHours(fromCity, toCity, aircraftClass, isRoundTrip) {
+  const home = findCityByKey(HOME_BASE_CITY_KEY);
+  if (!home) return { hours: 0, legs: [] };
+
+  const legs = [];
+  let hours = 0;
+
+  const baseIn = EXPECTED_POS_IN_HOURS[aircraftClass] ?? 1.0;
+
+  // scale slightly by city tier (how easy the market is)
+  const tierScale = (city) => {
+    if (city.tier === "major") return 1.0;
+    if (city.tier === "large") return 1.15;
+    return 1.3;
+  };
+
+  // If the trip starts at KAUS, assume some inbound positioning to KAUS
+  if (fromCity.icao === HOME_BASE_ICAO) {
+    const hIn = baseIn * tierScale(fromCity);
+    legs.push({ type: "MARKET_POS_IN", note: "Expected aircraft positioning into Austin market", hours: Math.round(hIn * 10) / 10 });
+    hours += hIn;
+  }
+
+  // If the trip ends at KAUS (one-way end at KAUS OR round-trip returns to KAUS),
+  // assume some outbound positioning after the trip.
+  const endsAt = isRoundTrip ? fromCity : toCity;
+  if (endsAt.icao === HOME_BASE_ICAO) {
+    const hOut = baseIn * EXPECTED_POS_OUT_MULT * tierScale(endsAt);
+    legs.push({ type: "MARKET_POS_OUT", note: "Expected aircraft positioning out of Austin market", hours: Math.round(hOut * 10) / 10 });
+    hours += hOut;
   }
 
   return { hours, legs };
@@ -265,7 +303,6 @@ function computeRiskScore({ departDateISO, region, pax, oneWayDistanceNm, isRoun
   if (waitDays >= 2) risk += 1;
   return risk;
 }
-
 function riskToMultiplier(risk) {
   if (risk <= 0) return VOLATILITY[0];
   if (risk === 1) return VOLATILITY[1];
@@ -277,12 +314,10 @@ function riskToMultiplier(risk) {
 /* ------------------------------ API Schema ------------------------------ */
 
 const EstimateRequestSchema = z.object({
-  // Prefer cityKey but also accept ICAO fallback so labels can change without breaking.
   fromCityKey: z.string().min(3).optional(),
   toCityKey: z.string().min(3).optional(),
   fromIcao: z.string().min(3).optional(),
   toIcao: z.string().min(3).optional(),
-
   departDateISO: z.string().min(8),
   isRoundTrip: z.boolean(),
   returnDateISO: z.string().nullable().optional(),
@@ -298,7 +333,6 @@ const EstimateRequestSchema = z.object({
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.get("/cities", (_req, res) => {
-  // ✅ Alphabetical by label
   const cities = CITIES
     .map((c) => ({
       cityKey: c.cityKey,
@@ -323,7 +357,6 @@ app.post("/estimate", (req, res) => {
 
   const input = parsed.data;
 
-  // ✅ Robust resolution: cityKey first, then ICAO
   const fromCity =
     (input.fromCityKey ? findCityByKey(input.fromCityKey) : null) ||
     (input.fromIcao ? findCityByIcao(input.fromIcao) : null);
@@ -340,56 +373,48 @@ app.post("/estimate", (req, res) => {
   const oneWayDistanceNm = haversineNm(fromCity, toCity);
   const region = tripRegion(fromCity, toCity);
 
-  // Allowed by pax
   const allowed = allowedClassesForPax(pax);
 
-  // Choose class
   let chosen =
     input.preferredClass === "AUTO"
       ? allowed[0]
       : input.preferredClass;
 
   if (!allowed.includes(chosen)) {
-    return res.status(400).json({
-      error: "Selected class not allowed for passenger count.",
-      details: { allowedClasses: allowed },
-    });
+    return res.status(400).json({ error: "Selected class not allowed for passenger count.", details: { allowedClasses: allowed } });
   }
 
-  // Ensure range capability (upgrade class if needed)
   chosen = ensureRangeClass(chosen, oneWayDistanceNm);
-
-  // If upgrade pushes outside pax-allowed, bump to smallest pax-allowed class that can do range
   if (!allowed.includes(chosen)) {
     chosen = allowed.find((cls) => oneWayDistanceNm <= MAX_RANGE_NM[cls]) || "HEAVY_JET";
   }
 
-  // Trip legs/hours
   const tripLegs = input.isRoundTrip ? 2 : 1;
   const tripLegHours = estimateLegBlockHours(oneWayDistanceNm, chosen);
   const tripHours = tripLegHours * tripLegs;
 
-  // Wait days (parking allowance only)
   let waitDays = 0;
   if (input.isRoundTrip && input.returnDateISO) {
     waitDays = Math.max(0, dayDiffUTC(input.departDateISO, input.returnDateISO));
   }
 
-  // Reposition from/to KAUS
-  const repo = estimateReposition(fromCity, toCity, chosen, input.isRoundTrip);
+  // HOME-base repo if trip starts/ends away from KAUS
+  const homeRepo = estimateHomeBaseReposition(fromCity, toCity, chosen, input.isRoundTrip);
 
-  // Fees
+  // NEW: expected market positioning even when KAUS is the origin/end
+  const marketPos = estimateExpectedMarketPositioningHours(fromCity, toCity, chosen, input.isRoundTrip);
+
+  const totalRepoHours = homeRepo.hours + marketPos.hours;
+
   const stops = input.isRoundTrip ? 2 : 1;
   const feeBand = region === "MEXICO" ? REGION_FEE_PER_STOP.MEXICO : REGION_FEE_PER_STOP.US;
   const fees = { low: stops * feeBand.low, high: stops * feeBand.high };
 
-  // Parking (modest)
   const parkBand = region === "MEXICO" ? PARKING_PER_DAY.MEXICO : PARKING_PER_DAY.US;
   const parking = { low: waitDays * parkBand.low, high: waitDays * parkBand.high };
 
-  // Base charter (hours * hourly band)
   const rate = RATE_TABLE[chosen];
-  const billableHours = tripHours + repo.hours;
+  const billableHours = tripHours + totalRepoHours;
 
   const base = {
     low: billableHours * rate.low,
@@ -401,7 +426,6 @@ app.post("/estimate", (req, res) => {
     high: base.high + fees.high + parking.high,
   };
 
-  // Volatility width
   const risk = computeRiskScore({
     departDateISO: input.departDateISO,
     region,
@@ -413,10 +437,11 @@ app.post("/estimate", (req, res) => {
 
   const mult = riskToMultiplier(risk);
 
-  let estimateLow = roundDownTo(subtotal.low * (1 - mult), 1000);
+  // ✅ KEY FIX: do NOT discount the low end with volatility
+  let estimateLow = roundDownTo(subtotal.low, 1000);
   let estimateHigh = roundUpTo(subtotal.high * (1 + mult), 1000);
 
-  // ✅ Apply markup (margin + FET)
+  // Apply markup
   const markup = Math.max(0, Math.min(0.50, DEFAULT_MARKUP_PCT));
   estimateLow = roundDownTo(estimateLow * (1 + markup), 1000);
   estimateHigh = roundUpTo(estimateHigh * (1 + markup), 1000);
@@ -441,8 +466,11 @@ app.post("/estimate", (req, res) => {
       one_way_distance_nm: Math.round(oneWayDistanceNm),
       trip_legs: tripLegs,
       trip_hours_est: Math.round(tripHours * 10) / 10,
-      reposition_hours_est: Math.round(repo.hours * 10) / 10,
-      reposition_legs: repo.legs,
+      reposition_hours_est: Math.round(totalRepoHours * 10) / 10,
+      reposition_detail: {
+        home_repo_legs: homeRepo.legs,
+        market_positioning: marketPos.legs,
+      },
       wait_days: waitDays,
       fees,
       parking,
@@ -451,18 +479,13 @@ app.post("/estimate", (req, res) => {
       volatility_multiplier: mult,
       assumptions: [
         "Estimate only (not a quote).",
-        "Reposition legs are modeled from/to Austin (KAUS) rather than billing large overnight/daily minimums.",
+        "Pricing includes expected aircraft positioning (market) in/out of Austin, plus home-base reposition when trip starts/ends away from KAUS.",
         "Multi-day round-trips use modest parking/handling allowances (not standby flight-hour billing).",
         "Market pricing varies by availability, operator, and routing.",
-      ],
-      may_change: [
-        "Actual reposition routing & availability",
-        "Handling/parking fees (especially Mexico)",
-        "Weather/ATC routing and time-of-day constraints",
       ],
     },
   });
 });
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
-app.listen(PORT, () => console.log(`Charter Calculator API (v3.1) running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Charter Calculator API (v3.2) running on port ${PORT}`));
